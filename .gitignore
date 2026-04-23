@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+bin/
+include/
+lib/
+scripts/
+
+# Cache e Logs do Pipeline
+.cache/
+*.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Type Checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Artigos e PDFs (Opcional, mas recomendado ignorar se forem pesados)
+# webmedia2025_saul.pdf
+
+# Jupyter Notebooks
+.ipynb_checkpoints
