@@ -1,4 +1,4 @@
-"""
+r"""
 ner_cluster_pipeline.py
 =======================
 
@@ -217,6 +217,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple, Union, cast, TypedDict
 
 import pandas as pd
+import numpy as np
 import torch
 import unicodedata
 import re
@@ -359,6 +360,9 @@ def quick_validate_input(input_path: str, sep: str) -> bool:
 class SpacyTokenPattern(TypedDict, total=False):
     LOWER: Union[str, Dict[str, Any]]
 
+# Alias de dict separado do TypedDict para não conflitar com Pylance/mypy
+SpacyEntityPatternDict = Dict[str, Union[str, List[Dict[str, Any]]]]
+
 def init_models() -> Tuple[TokenClassificationPipeline, spacy.Language, EntityRuler]:
     logging.info("[1/4] Inicializando modelos…")
     # HF
@@ -389,9 +393,6 @@ def init_models() -> Tuple[TokenClassificationPipeline, spacy.Language, EntityRu
         ruler = cast(EntityRuler, nlp_spacy.add_pipe("entity_ruler", before="ner"))
     else:
         ruler = cast(EntityRuler, nlp_spacy.get_pipe("entity_ruler"))
-
-    # Alias de dict separado do TypedDict para não conflitar com Pylance/mypy
-    SpacyEntityPatternDict = Dict[str, Union[str, List[Dict[str, Any]]]]
 
     patterns: List[SpacyEntityPatternDict] = [
         {
@@ -694,17 +695,61 @@ def assign_operations(df: pd.DataFrame, generic_entities: Set[str]) -> pd.DataFr
     return df
 
 
-def get_generic_entities_unsupervised(df: pd.DataFrame, threshold: int = 5) -> Set[str]:
-    logging.info(f"[gen] identificando entidades genéricas (meses distintos > {threshold})")
+def calcular_limite_densidade_histograma(
+    porcentagem_meses: pd.Series, 
+    corte_joelho: float,
+    largura_janela: float = 10.0,
+    limiar_entidades: int = 2,
+    passo: float = 0.5
+) -> float | None:
+    """
+    Calcula o limite genérico dinâmico baseado na densidade de entidades em janelas deslizantes.
+    Inicia a busca a partir do corte do joelho (limpeza de cauda longa) e avança para a direita
+    até encontrar um intervalo com escassez de entidades (rarefação).
+    
+    Retorna o valor de porcentagem de meses (início da janela com rarefação) ou None.
+    """
+    y_filtrado = porcentagem_meses[porcentagem_meses >= corte_joelho].to_numpy(dtype=float)
+    if len(y_filtrado) < 3:
+        return None
+        
+    atual = corte_joelho
+    while atual + largura_janela <= 100.0:
+        # Conta a quantidade de entidades no intervalo [atual, atual + largura_janela]
+        qtd_entidades = np.sum((y_filtrado >= atual) & (y_filtrado < atual + largura_janela))  # type: ignore[operator]
+        if qtd_entidades <= limiar_entidades:
+            return atual
+        atual += passo
+        
+    return None
+
+
+def get_generic_entities_unsupervised(df: pd.DataFrame, min_threshold: int = 5, ratio: float = 0.4167) -> Set[str]:
+    # Evita warnings de conversão de timezone ao trabalhar com períodos
+    df = df.copy()
+    if "data_postagem" in df.columns:
+        if df["data_postagem"].dt.tz is not None:
+            df["data_postagem"] = df["data_postagem"].dt.tz_localize(None)
+
+    total_months = 0
+    if "data_postagem" in df.columns:
+        total_months = df["data_postagem"].dt.to_period("M").nunique()
+    
+    if total_months == 0 or len(df) == 0:
+        logging.warning("[gen] total de meses ou de vídeos é 0. Nenhuma genérica encontrada.")
+        return set()
+
+    logging.info(f"[gen] identificando entidades genéricas (meses detectados: {total_months}, vídeos: {len(df)})")
     ner_cols_to_process = ["ner_titulo", "ner_descricao"]
     if "ner_transcribedText" in df.columns:
         ner_cols_to_process.append("ner_transcribedText")
 
-    df = df.copy()
+    # Identificador único de linha para contar vídeos únicos por entidade
+    df["_temp_video_id"] = range(len(df))
     df["all_ners"] = df[ner_cols_to_process].fillna("").agg(", ".join, axis=1)
 
     ner_date_df = (
-        df[["data_postagem", "all_ners"]]
+        df[["data_postagem", "_temp_video_id", "all_ners"]]
         .assign(all_ners=df["all_ners"].str.split(", "))
         .explode("all_ners")
         .rename(columns={"all_ners": "entity"})
@@ -713,11 +758,53 @@ def get_generic_entities_unsupervised(df: pd.DataFrame, threshold: int = 5) -> S
     ner_date_df.dropna(subset=["entity"], inplace=True)
     ner_date_df = ner_date_df[ner_date_df["entity"] != ""]
 
-    ner_date_df["year_month"] = ner_date_df["data_postagem"].dt.to_period("M")
-    temporal_freq = ner_date_df.groupby("entity")["year_month"].nunique()
-    generic_entities = set(temporal_freq[temporal_freq > threshold].index)
+    if ner_date_df.empty:
+        logging.info("[gen] nenhuma entidade de NER encontrada nos vídeos.")
+        return set()
 
-    logging.info(f"[gen] {len(generic_entities)} entidades genéricas encontradas")
+    ner_date_df["year_month"] = ner_date_df["data_postagem"].dt.to_period("M")
+
+    # 1. Proporção de meses
+    meses_por_entidade = ner_date_df.groupby("entity")["year_month"].nunique()
+    porcentagem_meses = (meses_por_entidade / total_months) * 100
+
+    # Ordenação e preparação para o cálculo do Joelho Geral
+    entidades_ordenadas = porcentagem_meses.sort_values(ascending=False)
+    y = entidades_ordenadas.values
+    x = np.arange(len(y))
+
+    # 2. Algoritmo do Joelho Geral (Filtro de Ruído de Cauda Longa)
+    corte_joelho = ratio * 100  # Fallback inicial
+    if len(y) >= 3:
+        p1 = np.array([x[0], y[0]])
+        p2 = np.array([x[-1], y[-1]])
+        dy = p2[1] - p1[1]
+        dx = p2[0] - p1[0]
+        denom = np.sqrt(dy**2 + dx**2)
+        if denom > 0:
+            distancias = [np.abs(dy * x[i] - dx * y[i] + p2[0]*p1[1] - p2[1]*p1[0]) / denom for i in range(len(y))]
+            corte_joelho = y[np.argmax(distancias)]
+
+    # 3. Cálculo dinâmico via Histograma de Densidade (Opção 1)
+    limite_calculado = calcular_limite_densidade_histograma(
+        porcentagem_meses=porcentagem_meses,
+        corte_joelho=corte_joelho,
+        largura_janela=10.0,
+        limiar_entidades=2,
+        passo=0.5
+    )
+
+    if limite_calculado is not None:
+        # Lógica Principal: Limite Dinâmico de Densidade
+        logging.info(f"[gen] limite genérico calculado dinamicamente: {limite_calculado:.2f}% dos meses (corte joelho: {corte_joelho:.2f}%)")
+        generic_entities = set(porcentagem_meses[porcentagem_meses >= limite_calculado].index)
+    else:
+        # Fallback Seguro: 41.67% dos meses ativos
+        limite_fallback = ratio * 100
+        logging.warning(f"[gen] cálculo dinâmico de densidade falhou ou retornou None. Ativando FALLBACK de {limite_fallback:.2f}% dos meses")
+        generic_entities = set(porcentagem_meses[porcentagem_meses >= limite_fallback].index)
+
+    logging.info(f"[gen] {len(generic_entities)} entidades genéricas encontradas no total")
     return generic_entities
 
 
@@ -793,17 +880,17 @@ def main() -> int:
             return 2
         try:
             init_models()
-            print("✓ Ambiente OK. Modelos carregam corretamente.")
+            print("[OK] Ambiente OK. Modelos carregam corretamente.")
             return 0
         except Exception:
-            print("✗ Falha na checagem de setup. Veja o arquivo de logs para detalhes.")
+            print("[ERRO] Falha na checagem de setup. Veja o arquivo de logs para detalhes.")
             return 3
 
     # Validação rápida do arquivo
     print("[1/4] Validando arquivo de entrada…")
     ok = quick_validate_input(args.input, args.sep)
     if not ok:
-        print("✗ Entrada inválida (detalhes no log).")
+        print("[ERRO] Entrada inválida (detalhes no log).")
         return 2
 
     # Carrega input original
@@ -811,7 +898,7 @@ def main() -> int:
         df_input = pd.read_csv(args.input, sep=args.sep)
     except Exception as e:
         logging.error(f"[io] erro ao ler entrada completa: {e}")
-        print("✗ Falha ao ler o arquivo de entrada.")
+        print("[ERRO] Falha ao ler o arquivo de entrada.")
         return 4
 
     # Converte data_postagem se existir
@@ -825,7 +912,7 @@ def main() -> int:
     try:
         nlp_hf, nlp_spacy, _ = init_models()
     except Exception:
-        print("✗ Falha ao inicializar modelos. Consulte o arquivo de logs.")
+        print("[ERRO] Falha ao inicializar modelos. Consulte o arquivo de logs.")
         return 5
 
     start_ts = pd.Timestamp.now()
@@ -845,14 +932,14 @@ def main() -> int:
     # Normalização das colunas ner_* (lendo do cache para manter fluxo simples)
     df_norm = load_data(cache_path)
     if df_norm.empty:
-        print("✗ Erro na normalização (detalhes no arquivo de logs).")
+        print("[ERRO] Erro na normalização (detalhes no arquivo de logs).")
         return 6
 
     # >>> NÃO filtramos por 'operation' antes de agrupar (mantém OPx para todas as linhas)
     df_work = df_norm.copy()
 
-    # Identifica entidades genéricas
-    generic_entities = get_generic_entities_unsupervised(df_work, threshold=5)
+    # Identifica entidades genéricas (threshold dinâmico baseado em % de meses)
+    generic_entities = get_generic_entities_unsupervised(df_work)
 
     # Agrupamento / atribuição de operações em TODO o df_norm
     df_assigned = assign_operations(df_work, generic_entities)
@@ -904,7 +991,7 @@ def main() -> int:
     final_df.to_csv(args.final_output, index=False, sep=args.sep)
     end_ts = pd.Timestamp.now()
 
-    print(f"✓ Arquivo salvo em: {args.final_output}")
+    print(f"[OK] Arquivo salvo em: {args.final_output}")
     print_final_summary(final_df, args, start_ts, end_ts)
     logging.info("[done] pipeline concluída com sucesso")
     return 0
